@@ -1,12 +1,12 @@
 {
-  "UniqueModName": "Dekar_FloatingCombatText",
+  "UniqueModName": "Dekar_FloatingCombatTextUnstable",
   "Assemblies": [
     "FloatingCombatText.dll"
   ],
   "Dependencies": [],
   "SteamTags": [
-    "0.9.1",
-    "0.9",
+    "UI",
+    "Overhaul",
     "Quality of Life"
   ]
 }

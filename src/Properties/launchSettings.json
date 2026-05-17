@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "FloatingCombatText": {
+      "commandName": "Project"
+    },
+    "Quasimorph": {
+      "commandName": "Executable",
+      "executablePath": "D:\\Program Files (x86)\\Steam\\steam.exe",
+      "commandLineArgs": "-applaunch 2059170"
+    }
+  }
+}

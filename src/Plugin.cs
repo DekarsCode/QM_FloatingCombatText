@@ -1,290 +1,277 @@
-﻿using System;
+﻿using HarmonyLib;
+using MGSC;
+using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
-using HarmonyLib;
-using MGSC;
+using System.Reflection.Emit;
+using System.Text.RegularExpressions;
 using TMPro;
 using UnityEngine;
 using Random = UnityEngine.Random;
-
 
 namespace FloatingCombatText
 {
     public static class Plugin
     {
-        /// <summary>
-        /// Indicates that game is the older 0.9.0 version.
-        /// </summary>
-        public static bool IsVersion090;
-
-        /// <summary>
-        /// Handle weapon damage and life changes differently to show crits
-        /// </summary>
-        public static bool ProcessingDamage = false;
         public static string ModAssemblyName => Assembly.GetExecutingAssembly().GetName().Name;
-        public static string ConfigPath => Path.Combine(Application.persistentDataPath, ModAssemblyName, "config.json");
-        public static string ModPersistenceFolder => Path.Combine(Application.persistentDataPath, ModAssemblyName);
-        public static ModConfig Config { get; private set; }
-        
-        
+        public static Color RedColor = new Color(0.85f, 0, 0);
+
         [Hook(ModHookType.AfterConfigsLoaded)]
         public static void AfterConfig(IModContext context)
         {
-            IsVersion090 = AppVersionIs090();
-
-            Directory.CreateDirectory(ModPersistenceFolder);
-
-            Config = ModConfig.LoadConfig(ConfigPath);
-
             new Harmony("Dekar_" + ModAssemblyName).PatchAll();
         }
 
 
-        /// <summary>
-        /// Returns true if the game is version is 0.9.0.
-        /// </summary>
-        /// <returns></returns>
-        private static bool AppVersionIs090()
+        [HarmonyPatch(typeof(Creature), nameof(Creature.OnWoundAdded))]
+        public static class Patch_OnWoundAdded
         {
-            try
+            public static void Postfix(Creature __instance, BodyPartWound bodyPartWound)
             {
-                List<int> version = GetMajorVersions(Application.version);
+                if (!__instance.IsSeenByPlayer)
+                    return;
 
-                return (version[0] == 0 && version[1] == 9 && version[2] == 0);
+                string tag = string.Empty;
+
+                switch (bodyPartWound.WoundCategory)
+                {
+                    case WoundCategory.Normal:
+                        tag = $"wound.{bodyPartWound.DmgType}.{bodyPartWound.WoundSlotRecord.NatureType}.name";
+                        break;
+                    case WoundCategory.Amputation:
+                        tag = "wound.amputation.name";
+                        break;
+                    case WoundCategory.Minor:
+                        tag = $"wound.minor.{bodyPartWound.DmgType}.{bodyPartWound.WoundSlotRecord.NatureType}.name";
+                        break;
+                }
+                var name = Localization.Get(tag);
+                name = Regex.Replace(name, @" \(.*\)", ""); //remove damage type
+
+                UI.Get<DungeonHudScreen>().AddFlyingDamage(__instance, 10, false, name);
+
+                var flyingDamageHintList = typeof(DungeonHudScreen).GetField("_flyingDamage", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(UI.Get<DungeonHudScreen>()) as List<FlyingDamageHint>;
+                var flyingDamageHint = flyingDamageHintList.Last();
+                var direction = new Vector3(0, -0.5f, 0);
+                typeof(FlyingDamageHint).GetField("_rootDestPos", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(flyingDamageHint, direction, BindingFlags.SetField, null, CultureInfo.CurrentCulture);
             }
-            catch (Exception ex)
+        }
+
+        [HarmonyPatch]
+        static class DamageSystemPatch
+        {
+            static MethodBase TargetMethod()
             {
-                Debug.LogError(new ApplicationException($"Error parsing version '{Application.version}'" , ex));
-                //Just assume it is not 0.9.0
+                var predicateClass = typeof(DamageSystem).GetNestedTypes(AccessTools.all).First(n => n.Name == "<>c");
+                var method = predicateClass.GetMethods(AccessTools.all).First(n => n.Name.Contains("b__13"));
+                return method;
+            }
+
+            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+            {
+                var ballisticField = AccessTools.DeclaredField(typeof(Ballistic), "InitialPosition");
+                var codeMatcher2 = new CodeMatcher(instructions);
+                codeMatcher2 = codeMatcher2.MatchStartForward(
+                        CodeMatch.LoadsField(ballisticField)
+                    );
+
+                var codeMatcher = new CodeMatcher(instructions);
+
+                codeMatcher = codeMatcher.MatchStartForward(
+                        CodeMatch.Calls(() => default(DungeonHudScreen).AddFlyingDamage(default, default, default, default, false))
+                    ).ThrowIfInvalid("AddFlyingDamage");
+
+                var labels = codeMatcher.Instruction.ExtractLabels();
+
+                codeMatcher = codeMatcher.RemoveInstruction()
+                    .InsertAndAdvance(
+                        CodeInstruction.LoadLocal(2), //Ballistic
+                        new CodeInstruction(OpCodes.Ldfld, AccessTools.Field(typeof(Ballistic), "InitialPosition")),
+                        CodeInstruction.Call(() => CreateFloatingText(default, default, default, default, default, default, default))
+                    ).AddLabelsAt(codeMatcher.Pos - 3, labels);
+                
+                instructions = codeMatcher.Instructions();
+                return instructions;
+            }
+        }
+
+        [HarmonyPatch]
+        static class CreaturePatch
+        {
+            static MethodBase TargetMethod()
+            {
+                var creatureHelperClass = typeof(Creature).GetNestedTypes(AccessTools.all).First(c => c.Name.Contains("<>c") && c.GetMethods(AccessTools.all).Any(m => m.Name.Contains("<MeleeAttack>")));
+                var method = creatureHelperClass.GetMethods(AccessTools.all).First(n => n.Name.Contains("<MeleeAttack>"));
+                return method;
+            }
+
+            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+            {
+                var codeMatcher = new CodeMatcher(instructions);
+                codeMatcher = codeMatcher.MatchStartForward(
+                        CodeMatch.Calls(() => default(DungeonHudScreen).AddFlyingDamage(default, default, default, default, false))
+                    )
+                    .ThrowIfInvalid("Could not find call to AddFlyingDamage");
+
+                var labels = codeMatcher.Instruction.ExtractLabels();
+
+                codeMatcher = codeMatcher.RemoveInstruction()
+                    .InsertAndAdvance(
+                        CodeInstruction.LoadArgument(0), //ldarg.0  attacking creature
+                        CodeInstruction.Call(() => CreateFloatingTextMelee(default, default, default, default, default, default, default))
+                    ).AddLabelsAt(codeMatcher.Pos - 2, labels);
+                
+                instructions = codeMatcher.Instructions();
+                return instructions;
+            }
+        }
+
+        [HarmonyPatch]
+        static class ExplosionPatch
+        {
+            static MethodBase TargetMethod()
+            {
+                var predicateClass = typeof(ExplosionEntity);
+                var method = predicateClass.GetMethods(AccessTools.all).First(n => n.Name.Contains("ProcessExplosionCell"));
+                return method;
+            }
+
+            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+            {
+                var codeMatcher = new CodeMatcher(instructions);
+                codeMatcher = codeMatcher.MatchStartForward(
+                        CodeMatch.Calls(() => default(DungeonHudScreen).AddFlyingDamage(default, default, default, default, false))
+                    ).ThrowIfInvalid("AddFlyingDamage");
+
+                codeMatcher = codeMatcher.RemoveInstruction()
+                    .InsertAndAdvance(
+                        CodeInstruction.LoadArgument(0), //this, ExplosionEntity
+                        new CodeInstruction(OpCodes.Ldfld, AccessTools.Field(typeof(ExplosionEntity), "_position")),
+                        CodeInstruction.Call(() =>
+                            CreateFloatingText(default, default, default, default, default, default, default))
+                    );
+
+                instructions = codeMatcher.Instructions();
+                return instructions;
+            }
+        }
+
+        [HarmonyPatch(typeof(FlyingDamageHint), "Initialize")]
+        public static class PatchInitialize
+        {
+            public static void Prefix(FlyingDamageHint __instance, MapRenderer mapRenderer, Creature creature, int damage, bool isCrit, ref string wound, ref bool wasImmune, out string __state)
+            {
+                __state = wound;
+                creature = null;
+                wound = "";
+                var creatureField = typeof(FlyingDamageHint).GetField("_creature", BindingFlags.Instance | BindingFlags.NonPublic);
+                creatureField?.SetValue(__instance, null, BindingFlags.SetField, null, CultureInfo.CurrentCulture);
+            }
+
+            public static void Postfix(FlyingDamageHint __instance, MapRenderer mapRenderer, Creature creature, int damage, bool isCrit, string wound, ref bool wasImmune, ref TextMeshProUGUI ____damageText, ref Vector3 ____rootPos, ref Vector3 ____rootDestPos, string __state)
+            {
+                ____damageText.color = isCrit ? Colors.Yellow : (damage < 0 ? Colors.Green : Color.white);
+                ____rootPos = creature.Creature3dView.transform.position + new Vector3(0.0f, 0.25f, 0.0f) + (Vector3)Random.insideUnitCircle*0.10f;
+                ____rootDestPos = Vector3.zero;
+                ____damageText.fontSize = (float)(5 + Math.Sqrt(damage));
+                ____damageText.outlineWidth = 0.15f;
+                ____damageText.outlineColor = Color.black;
+                ____damageText.fontStyle = FontStyles.Bold;
+
+                if (__state != string.Empty)
+                {
+                    //todo randomize position, speed?
+                    ____damageText.text = __state;
+                    ____damageText.color = RedColor;
+                    ____damageText.fontSize = (float)(3 + Math.Sqrt(damage)); //todo base size on severity?
+                    ____damageText.autoSizeTextContainer = true;
+                }
+
+                var canvasGroup = typeof(FlyingDamageHint).GetField("_canvasGroup", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(__instance) as CanvasGroup;
+                canvasGroup.alpha = 1;
+            }
+        }
+
+
+        [HarmonyPatch(typeof(FlyingDamageHint), "LateUpdate")]
+        public static class PatchLateUpdate
+        {
+            public static bool Prefix(FlyingDamageHint __instance, ref float ____time, ref float ____duration, ref Vector3 ____rootPos, ref Vector3 ____rootDestPos, ref MapRenderer ____mapRenderer, ref float ____cachedSize, ref TextMeshProUGUI ____damageText)
+            {
+                ____time += Time.deltaTime;
+                ____rootPos += ____rootDestPos * Time.deltaTime;
+                ____rootDestPos -= ____rootDestPos * 0.5f * Time.deltaTime;
+                var screenPos = (Vector2)____mapRenderer.WorldToScreenPos(____rootPos);
+                RectTransformUtility.ScreenPointToLocalPointInRectangle(MGSC.UI.ScreenRoot, screenPos, null, out var localPoint);
+                __instance.transform.localPosition = localPoint;
+                __instance.transform.localScale = new Vector3(____cachedSize, ____cachedSize, ____cachedSize);
+
+                if (____time < ____duration)
+                    return false; //skip original code
+                
+                var canvasGroup = typeof(FlyingDamageHint).GetField("_canvasGroup", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(__instance) as CanvasGroup;
+                canvasGroup.alpha = 0;
+                return true; //run original code for cleanup
+            }
+        }
+
+        [HarmonyPatch(typeof(FlyingDamageHint), "CanMerge")]
+        public static class PatchCanMerge
+        {
+            public static bool Prefix(FlyingDamageHint __instance, ref bool __result, Creature creature, int damage, bool isCrit, string wound)
+            {
+                __result = false;
                 return false;
             }
-
         }
 
-        /// <summary>
-        /// Returns the Major, minor, micro versions of the game.
-        /// Note that Quasimorph's versions have optional parts and only the Major version and the two right most 
-        /// parts are returned.  The right most being platform build and possibly another build number.
-        /// If there are any missing parts for the first three parts, they will be replaced with a zero.
-        /// Example of valid versions:
-        /// 0.9.1.382s.97e4007  == 0.9.1
-        /// 0.9.375s.aec664d == 0.9.0
-        /// </summary>
-        /// <param name="version"></param>
-        public static List<int> GetMajorVersions(string version)
+        public static void CreateFloatingTextMelee(
+            DungeonHudScreen ui,
+            Creature creature,
+            int damage,
+            bool isCrit,
+            string wound,
+            bool wasImmune,
+            object createHelper)
         {
-            string[] versionParts = version.Split('.');
-
-            //Get everything but the last two build parts.
-            List<int> numericVersion = versionParts
-                .Where((x, i) => i < versionParts.Length - 2)
-                .Select(x => int.Parse(x))
-                .ToList();
-
-            //Add in any parts that are missing from the first three parts.
-            //Ex 1 = 1.0.0
-            for (int i = numericVersion.Count; i <= 3; i++)
-            {
-                numericVersion.Add(0);
-            }
-
-            return numericVersion;
+            var type2 = createHelper.GetType();
+            Creature attacker = AccessTools.Field(type2, "<>4__this").GetValue(createHelper) as Creature;
+            var creatureData = attacker.CreatureData;
+            var damageOriginCell = creatureData.Position;
+            CreateFloatingText(ui, creature, damage, isCrit, wound, wasImmune, damageOriginCell);
         }
 
-
-        public static void CreateWeaponDamageFloatingText(Creature creature, DamageHitInfo hitInfo)
+        public static void CreateFloatingText(
+            DungeonHudScreen ui,
+            Creature creature,
+            int damage,
+            bool isCrit,
+            string wound,
+            bool wasImmune,
+            CellPosition damageOriginCell)
         {
-            if (!creature.IsSeenByPlayer)
-                return;
-     
-            var textColor = hitInfo.wasCrit ? Color.yellow : Color.white;
-            var text = hitInfo.wasCrit ? hitInfo.finalDmg + "!" : hitInfo.finalDmg.ToString();
-
-            CreateDamageFloatingText(creature, text, textColor);
-        }
-
-        public static void CreateDamageFloatingText(Creature creature, string text, Color textColor)
-        {
-            if (!creature.IsSeenByPlayer)
-                return;
-
-            var offsetX = Random.value * 2 * Config.DamageRandomOffsetX - Config.DamageRandomOffsetX + Config.DamagePositionX;
-            var offsetY = Random.value * 2 * Config.DamageRandomOffsetY - Config.DamageRandomOffsetY + Config.DamagePositionY;
-            var offsetZ = Config.DamagePositionZ;
-
-            CreateFloatingText(creature, text, Config.DamageFontSize, Config.DamageDuration, Config.DamageFloatSpeed, textColor, Color.black, offsetX, offsetY, offsetZ);
-        }
-        
-
-        public static void CreateFloatingText(Creature creature, string text, float fontSize,
-            float duration, float floatSpeed, Color textColor, Color outlineColor, float offsetX, float offsetY,
-            float offsetZ)
-        {
-            var floatingTextGameObject = new GameObject("floatingText");
-            floatingTextGameObject.transform.localPosition = creature.gameObject.transform.localPosition + new Vector3(offsetX, offsetY, offsetZ);
-            var textComponent = floatingTextGameObject.AddComponent<TextMeshPro>();
-            var behaviourComponent = floatingTextGameObject.AddComponent<FloatingTextBehaviour>();
-
-            behaviourComponent.FloatSpeed = floatSpeed;
-            behaviourComponent.RemainingTime = duration;
-            behaviourComponent.enabled = true;
+            ui.AddFlyingDamage(creature, damage, isCrit, string.Empty);
+            var flyingDamageHintList = typeof(DungeonHudScreen).GetField("_flyingDamage", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(ui) as List<FlyingDamageHint>;
+            var flyingDamageHint = flyingDamageHintList.Last();
             
-            textComponent.text = text;
-            textComponent.fontSize = fontSize;
-            textComponent.fontStyle = FontStyles.Bold;
-            textComponent.lineSpacing = 1;
-            textComponent.alignment = TextAlignmentOptions.Center;
-            textComponent.color = textColor;
-            textComponent.outlineColor = outlineColor;
-            textComponent.outlineWidth = 0.3f;
-        }
-    }
+            Vector3 direction = (creature.CreatureData.Position - damageOriginCell).ToVector2().normalized;
+            
+            Vector3 perpendicular = Vector3.Cross(direction, Vector3.up);
+            if (perpendicular.sqrMagnitude < 0.001f)
+                perpendicular = Vector3.Cross(direction, Vector3.right);
 
+            float angleOffset = Random.Range(-25, 25);
+            float randomSpin = Random.Range(-25, 25);
 
-    [HarmonyPatch(typeof(Creature), "ProcessDamage")]
-    public static class Patch_OnProcessDamageCreature
-    {
-        public static void Prefix(Creature __instance, DamageHitInfo hitInfo)
-        {
-            Plugin.ProcessingDamage = true;
-        }
+            Quaternion spin = Quaternion.AngleAxis(randomSpin, direction);
+            Quaternion tilt = Quaternion.AngleAxis(angleOffset, spin * perpendicular);
 
-        public static void Postfix(Creature __instance, DamageHitInfo hitInfo)
-        {
-            Plugin.CreateWeaponDamageFloatingText(__instance, hitInfo);
-            Plugin.ProcessingDamage = false;
-
-        }
-    }
-
-    [HarmonyPatch(typeof(Player), "ProcessDamage")]
-    public static class Patch_OnProcessDamagePlayer
-    {
-        public static void Prefix(Player __instance, DamageHitInfo hitInfo)
-        {
-            Plugin.ProcessingDamage = true;
-        }
-        public static void Postfix(Player __instance, DamageHitInfo hitInfo)
-        {
-            Plugin.CreateWeaponDamageFloatingText(__instance, hitInfo);
-            Plugin.ProcessingDamage = false;
-
-        }
-    }
-
-    [HarmonyPatch(typeof(Creature), "HealthOnValueChanged")]
-    public static class Patch_HealthChangedCreature
-    {
-        public static void Postfix(Creature __instance, int obj)
-        {
-            if (!Plugin.ProcessingDamage)
-            {
-                if(obj < 0)
-                    Plugin.CreateDamageFloatingText(__instance, (-obj).ToString(), Color.green);
-                else if (obj > 0)
-                    Plugin.CreateDamageFloatingText(__instance, obj.ToString(), Color.white);
-            }
-        }
-    }
-
-    [HarmonyPatch(typeof(Player), "HealthOnValueChanged")]
-    public static class Patch_HealthChangedPlayer
-    {
-        public static void Postfix(Player __instance, int obj)
-        {
-            if (!Plugin.ProcessingDamage)
-            {
-                if (obj < 0)
-                    Plugin.CreateDamageFloatingText(__instance, (-obj).ToString(), Color.green);
-                else if (obj > 0)
-                    Plugin.CreateDamageFloatingText(__instance, obj.ToString(), Color.white);
-            }
-        }
-    }
-
-
-    [HarmonyPatch(typeof(Creature), nameof(Creature.OnWoundAdded))]
-    public static class Patch_OnWoundAdded
-    {
-        public static void Postfix(Creature __instance, BodyPartWound bodyPartWound)
-        {
-            if (!__instance.IsSeenByPlayer)
-                return;
-
-            var offsetX = Random.value * 2 * Plugin.Config.WoundRandomOffsetX - Plugin.Config.WoundRandomOffsetX + Plugin.Config.WoundPositionX;
-            var offsetY = Random.value * 2 * Plugin.Config.WoundRandomOffsetY - Plugin.Config.WoundRandomOffsetY + Plugin.Config.WoundPositionY;
-            var offsetZ = Plugin.Config.WoundPositionZ;
-
-
-            string woundName = Plugin.IsVersion090 ? GetWoundText090(bodyPartWound): GetWoundText(bodyPartWound) ;
-
-            Plugin.CreateFloatingText(__instance, woundName, Plugin.Config.WoundFontSize, Plugin.Config.WoundDuration, Plugin.Config.WoundFloatSpeed, new Color(0.8f, 0.0f, 0f), new Color(0.3f, 0.0f, 0.0f), offsetX, offsetY, offsetZ);
-        }
-
-        /// <summary>
-        /// The combat text for version 0.9.0.
-        /// Get the localized text for the wound.
-        /// Adapted from MGSC.TooltipFactory.BuildBodyPartWoundTooltip(MGSC.BodyPartWound, MGSC.EffectsController)
-        /// </summary>
-        /// <param name="bodyPartWound"></param>
-        /// <returns></returns>
-        private static string GetWoundText090(BodyPartWound bodyPartWound)
-        {
-            BodyPartWound item = bodyPartWound;     //Keeping to match the game's code this is from.
-
-            string natureType = Data.WoundSlots.GetRecord(item.WoundSlotId).NatureType;
-
-            string key;
-
-            if (item.IsAmputation)
-            {
-                key = "wound.amputation." + item.SlotPositionType + "." + item.DmgType + "." + natureType + ".name";
-            }
-            else if (item.IsMinor)
-            {
-                key = "wound.minor." + item.DmgType + "." + natureType + ".name";
-            }
-            else
-            {
-                key = "wound." + item.SlotPositionType + "." + item.DmgType + "." + natureType + ".name";
-            }
-
-            return Localization.Get(key);
-
-        }
-
-        /// <summary>
-        /// Get the localized text for the wound.
-        /// Adapted from MGSC.TooltipFactory.BuildBodyPartWoundTooltip(MGSC.BodyPartWound, MGSC.EffectsController)
-        /// </summary>
-        /// <param name="bodyPartWound"></param>
-        /// <returns></returns>
-        private static string GetWoundText(BodyPartWound bodyPartWound)
-        {
-            BodyPartWound item = bodyPartWound;     //Keeping to match the game's code this is from.
-
-            string dmgType = item.DmgType;
-            string natureType = Data.WoundSlots.GetRecord(item.WoundSlotId).NatureType;
-
-            string locationText = Localization.Get($"woundslot.{item.WoundSlotId}.name");
-            string damageKey;
-
-            if (item.IsAmputation)
-            {
-                damageKey = "woundtype.amputated";
-            }
-            else if (item.IsMinor)
-            {
-                damageKey = $"wound.minor.{dmgType}.{natureType}.name";
-            }
-            else
-            {
-                damageKey = $"wound.{dmgType}.{natureType}.name";
-            }
-
-            return locationText + " " + Localization.Get(damageKey);
+            direction = (tilt * direction).normalized * 0.7f * Math.Min((float)(Math.Sqrt(damage) / 5), 2);
+            
+            //Reuse _rootDestPos to store velocity of movement
+            typeof(FlyingDamageHint).GetField("_rootDestPos", BindingFlags.Instance | BindingFlags.NonPublic)?.SetValue(flyingDamageHint, direction, BindingFlags.SetField, null, CultureInfo.CurrentCulture);
         }
     }
 }
